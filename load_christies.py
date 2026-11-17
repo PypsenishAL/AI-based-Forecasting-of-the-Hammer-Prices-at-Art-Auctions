@@ -51,6 +51,7 @@ IMAGE_HOSTS = {"www.christies.com", "www.christies-media.com",
                "onlineonly.christies.com", "cdn.christies.com"}
 MAX_BODY = 25 * 1024 * 1024
 MANIFEST = "collection.json"
+HISTORY_FILE = "artist_history.json"
 
 
 class PipelineError(Exception):
@@ -86,7 +87,7 @@ def check_deadline(start, now):
 
 def checked_url(value, hosts):
     url = urlsplit(value)
-    if (url.scheme != "https" or url.netloc not in hosts
+    if (url.scheme != "https" or url.hostname not in hosts or url.port not in (None, 443)
             or url.username is not None or url.password is not None):
         raise PipelineError(f"Unexpected Christie’s URL: {value}")
     return value
@@ -353,7 +354,7 @@ def is_link(path):
 def hash_files(folder):
     """Fingerprint only the expected, flat snapshot layout."""
     entries = {entry.name: entry for entry in folder.iterdir()}
-    allowed = {"lots.csv", "estimates.csv", "errors.txt", "images", MANIFEST}
+    allowed = {"lots.csv", "estimates.csv", "errors.txt", "images", MANIFEST, HISTORY_FILE}
     if ("images" not in entries or set(entries) - allowed
             or any(is_link(entry) for entry in entries.values())):
         raise PipelineError("Snapshot contains additional files or links")
@@ -443,6 +444,11 @@ def archive_used_lots(snapshot, lot_ids):
                 shutil.copyfile(snapshot / row["image_path"], staging / row["image_path"])
             if "errors.txt" in hashes:
                 shutil.copyfile(snapshot / "errors.txt", staging / "errors.txt")
+            if HISTORY_FILE in hashes:
+                history = json.loads((snapshot / HISTORY_FILE).read_text(encoding="utf-8"))
+                history["lots"] = [row for row in history["lots"] if row["lot_id"] in lot_ids]
+                (staging / HISTORY_FILE).write_text(
+                    json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             destination = free_name(archive, name)
             staging.rename(destination)
         finally:
@@ -673,6 +679,8 @@ def parse_args(argv=None):
     parser.add_argument("--lot-urls-file", type=Path, help="Manual fallback, one lot URL per line")
     parser.add_argument("--output-dir", type=Path, default=Path("snapshots"))
     parser.add_argument("--limit", type=int, choices=range(10, 16), default=12)
+    parser.add_argument("--skip-history", action="store_true",
+                        help="Save the snapshot without downloading the five-year artist history")
     args = parser.parse_args(argv)
     if args.catalog_url is None:
         if any(value is not None for value in (args.overview_url, args.lot_from, args.lot_to,
@@ -720,6 +728,10 @@ def main(argv=None):
             print(f"Collection stopped: {exc}", file=sys.stderr)
             return 1
     print(f"Saved {count} lots: {path.resolve()}")
+    if not args.skip_history:
+        from artist_history import main as collect_history
+
+        return collect_history([str(path)])
     return 0
 
 
