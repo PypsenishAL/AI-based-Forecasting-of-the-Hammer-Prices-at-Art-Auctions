@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 import load_christies as loader
 
@@ -53,11 +53,42 @@ def pages():
             '<br>canvas: 20 x 30 cm.<br>overall: 21 x 31 cm.'
             '<br>Painted in 1999.</div></chr-accordion-item>'
             f'<div region="lot-header-image"><img data-srcset="{photo} 600w"></div>')
-    responses[CATALOG] = auction + component('lots', dict(data=dict(lots=catalog_rows)))
+    responses[CATALOG] = auction + component('lots', dict(
+        data=dict(lots=catalog_rows, total_hits_filtered=len(catalog_rows))))
     return responses
 
 
+def ready_history(lots, start, *, generated=None, coverage="scanned"):
+    return {
+        "schema_version": 2, "coverage_status": coverage, "source_errors": [],
+        "session_start_utc": loader.utc_text(start),
+        "cutoff_utc": lots[0]["collected_at_utc"],
+        "generated_at_utc": generated or lots[-1]["collected_at_utc"],
+        "lots": [{"lot_id": row["lot_id"], "hammer_comparables": {
+            "price_basis": "hammer_price", "status": "unavailable", "groups": {}, "sales": []}}
+            for row in lots],
+    }
+
+
 class LoaderTests(unittest.TestCase):
+    def test_estimate_rejects_disagreement_with_display(self):
+        with self.assertRaisesRegex(loader.PipelineError, "display"):
+            loader.estimate_data(
+                dict(estimate_txt="USD 300 - 400", estimate_low=100, estimate_high=200),
+                {"currency_txt": "USD"},
+            )
+
+    def test_blind_text_drops_unlabelled_amounts_without_stripping_artist_name(self):
+        self.assertEqual(loader.blind_text(r"Estimate\n400000–600000\nGallery A"), "Gallery A")
+        self.assertEqual(loader.blind_text(r"Estimate\n100–200\nGallery A"), "Gallery A")
+        self.assertEqual(loader.blind_text("Ken Price", identity_field=True), "Ken Price")
+
+    def test_session_supports_suffixed_numbers(self):
+        low, high, _ = next(loader.numeric_sessions(
+            {"sessions": [{"lot_txt": "Lots 1A–79A"}]}))
+        self.assertTrue(loader.in_lot_range(loader.lot_number({"lot_id_txt": "20A"}), low, high))
+        self.assertFalse(loader.in_lot_range(loader.lot_number({"lot_id_txt": "20B"}), low, high))
+
     def test_end_to_end_keeps_valid_lots_and_logs_price_and_bad_image(self):
         image = io.BytesIO()
         Image.new('RGB', (200, 150)).save(image, 'PNG')
@@ -92,8 +123,14 @@ class LoaderTests(unittest.TestCase):
 
     def test_new_snapshot_replaces_expired_unmodified_data_and_retains_used_lots(self):
         responses = pages()
+        url = 'https://www.christies.com/en/lot/lot-702'
+        responses[url] += ('<chr-accordion-item><div slot="header">Provenance</div>'
+                           '<div slot="content"><div>Private collection</div><div>Gallery A</div>'
+                           '<div>Estimate USD 400,000</div></div></chr-accordion-item>')
         image = io.BytesIO()
-        Image.new('RGB', (200, 150)).save(image, 'PNG')
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text('Comment', 'Estimate USD 400,000')
+        Image.new('RGB', (200, 150)).save(image, 'PNG', pnginfo=metadata)
 
         def fetch(url):
             return responses[url].encode() if url in responses else image.getvalue()
@@ -102,8 +139,8 @@ class LoaderTests(unittest.TestCase):
         later = '2027-03-04T15:30:00Z'
         with tempfile.TemporaryDirectory() as folder:
             old_args = manual_args(['--output-dir', folder, '--limit', '10'])
-            old, _ = loader.collect(old_args, fetch, lambda: NOW)
-            edited, _ = loader.collect(old_args, fetch, lambda: NOW)
+            old, _ = loader.collect(old_args, fetch, lambda: NOW, ready_history)
+            edited, _ = loader.collect(old_args, fetch, lambda: NOW, ready_history)
             with (edited / 'errors.txt').open('a', encoding='utf-8') as file:
                 file.write('analysis notes\n')
             saved = loader.archive_used_lots(old, {'702', '703'})
@@ -114,13 +151,30 @@ class LoaderTests(unittest.TestCase):
             with self.assertRaises(loader.PipelineError):
                 loader.collect(fresh_args, lambda url: old_failures[url].encode(), lambda: march)
             self.assertTrue(old.exists())
-            fresh, _ = loader.collect(fresh_args, fetch, lambda: march)
+            with self.assertRaisesRegex(loader.HistoryReadinessError, "incomplete"):
+                loader.collect(fresh_args, fetch, lambda: march,
+                               lambda lots, start: ready_history(lots, start, coverage="partial"))
+            self.assertTrue(old.exists())
+            with self.assertRaisesRegex(loader.HistoryReadinessError, "timestamps"):
+                loader.collect(fresh_args, fetch, lambda: march,
+                               lambda lots, start: ready_history(lots, start, generated=later))
+            self.assertTrue(old.exists())
+            fresh, _ = loader.collect(fresh_args, fetch, lambda: march, ready_history)
             self.assertTrue(fresh.exists())
             self.assertFalse(old.exists())
             self.assertTrue(edited.exists())
-            self.assertEqual({p.stem for p in (saved / 'images').iterdir()}, {'702', '703'})
-            with (saved / 'lots.csv').open(encoding='utf-8-sig', newline='') as file:
+            self.assertEqual({p.stem for p in (saved / 'audit' / 'images').iterdir()}, {'702', '703'})
+            with (saved / 'audit' / 'lots.csv').open(encoding='utf-8-sig', newline='') as file:
                 self.assertEqual([row['lot_id'] for row in csv.DictReader(file)], ['702', '703'])
+            blind = json.loads((saved / 'blind' / 'lots.json').read_text(encoding='utf-8'))['lots']
+            arbiter = json.loads((saved / 'arbiter' / 'estimates.json').read_text(encoding='utf-8'))['lots']
+            self.assertEqual([r['sample_id'] for r in blind], [r['sample_id'] for r in arbiter])
+            self.assertNotIn('estimate_low', blind[0])
+            self.assertNotIn('lot_url', blind[0])
+            self.assertNotIn('lot_id', blind[0])
+            self.assertEqual(blind[0]["provenance_raw"], "Private collection\nGallery A")
+            with Image.open(saved / "blind" / blind[0]["image_path"]) as clean_photo:
+                self.assertNotIn("Comment", clean_photo.info)
 
     def test_deadline_rejects_before_any_http_request(self):
         with self.assertRaisesRegex(loader.PipelineError, 'deadline'):
@@ -145,6 +199,38 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0].suffix, '.incomplete')
             self.assertIn('status', (attempts[0] / 'errors.txt').read_text(encoding='utf-8'))
+
+    def test_earlier_session_does_not_block_future_session(self):
+        html = pages()[OVERVIEW]
+        status = {"is_in_progress": True, "is_auction_over": False, "sessions": [
+            {"lot_txt": "Lots 601-648", "date_time_universal": "2026-11-20T14:30Z"},
+            {"lot_txt": "Lots 701-864", "date_time_universal": START},
+        ]}
+        auction = loader.component(html, "auction")["data"]
+        html = component("auction", {"data": dict(auction, auction_status=status)})
+        _, official = loader.confirm_schedule(html, OVERVIEW, (701, ""), (864, ""), None,
+                                               lambda: loader.utc_datetime("2026-11-20T15:00Z"))
+        self.assertEqual(loader.utc_text(official), START)
+
+    def test_current_catalogue_reads_reported_extra_pages(self):
+        first = {"object_id": "1"}
+        last = {"object_id": "2"}
+        endpoint = {"path": "api/discoverywebsite/auctionpages/lotsearch",
+                    "parameters": {"pagesize": "1", "saleid": "31037",
+                                   "salenumber": "24268", "saleroomcode": "NYR"}}
+        html = component("lots", {"data": {"lots": [first], "total_hits_filtered": 2,
+                                           "lot_search_api_endpoint": endpoint}})
+
+        def fetch(url):
+            self.assertIn("page=2", url)
+            return json.dumps({"lots": [last], "total_hits_filtered": 2}).encode()
+
+        self.assertEqual(loader.current_catalogue_rows(html, CATALOG, fetch), [first, last])
+        truncated = html.replace('"total_hits_filtered": 2', '"total_hits_filtered": 3').replace(
+            '"pagesize": "1"', '"pagesize": "2"').replace(
+            '"lots": [{"object_id": "1"}]', '"lots": [{"object_id": "1"}, {"object_id": "2"}]')
+        with self.assertRaises(loader.PipelineError):
+            loader.current_catalogue_rows(truncated, CATALOG, lambda _: b"[]")
 
     def test_automatic_collection_after_pilot_uses_next_month_and_official_session_time(self):
         later = '2026-12-01T17:00:00Z'

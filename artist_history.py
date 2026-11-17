@@ -9,8 +9,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
-from uuid import uuid4
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,23 +22,12 @@ import load_christies as loader
 
 RESULTS = loader.BASE + "/en/results"
 ONLINE = "https://onlineonly.christies.com"
-PAGINATION = loader.BASE + "/api/discoverywebsite/auctionpages/lotsearch"
 CATALOGUE_TITLE = re.compile(
     r"paintings?|old masters|contemporary|modern|impressionis|post.war|(?:20th|21st|19th) century"
     r"|art (?:américain|européen|d'asie)|american art|british art|latin american art"
     r"|(?:chinese|indian|african|australian|canadian|irish|swiss|belgian) art|first open", re.I,
 )
 NON_PAINTING_CATALOGUE = re.compile(r"\b(?:prints|multiples|works on paper|photographs|sculpture)\s*$", re.I)
-PAINT = re.compile(
-    r"(?:oil|acrylic|tempera|gouache|watercolou?r|distemper|encaustic|casein)"
-    r"(?:\s+and\s+(?:oil|acrylic|tempera|gouache|watercolou?r|distemper|encaustic|casein"
-    r"|marker|graphite|charcoal|pastel|ink))*"
-    r"\s+(?:on|over)\s+[\w].*", re.I,
-)
-NON_PAINT = re.compile(
-    r"\b(?:prints?|printed|lithograph\w*|screenprint\w*|silkscreen\w*|etching\w*|engraving\w*"
-    r"|photograph\w*|collage\w*|mixed media|monotype\w*|sculpture\w*|bronze|cast)\b", re.I,
-)
 LIFESPAN = re.compile(r"\s*\((?P<dates>(?:b(?:orn)?\.?\s*)?\d{4}(?:\s*[-–—]\s*\d{4})?)\)\s*$", re.I)
 SOURCE_ERRORS = (loader.PipelineError, requests.RequestException, UnicodeError, ValueError)
 
@@ -65,13 +53,33 @@ def artist_identity(value):
 
 
 def painting_technique(description):
-    lines = loader.plain_text(description).splitlines()
-    for line in lines[2:]:
-        if NON_PAINT.search(line) and (PAINT.fullmatch(line) or NON_PAINT.match(line)):
-            return ""
-        if PAINT.fullmatch(line):
-            return line
-    return ""
+    return loader.painting_category(loader.plain_text(description))
+
+
+def area_cm2(dimensions):
+    pattern = r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*cm\b"
+    lines = dimensions.replace(r"\n", "\n").splitlines()
+    measurements = [line for line in lines if not re.match(r"\s*(?:overall|frame[d]?)\b", line, re.I)]
+    matches = [match for line in measurements for match in re.finditer(pattern, line, re.I)]
+    if len(matches) != 1:
+        return None
+    height, width = map(Decimal, matches[0].groups())
+    return height * width if height > 0 and width > 0 else None
+
+
+def verified_hammer(row, currency, realised):
+    raw = loader.plain_text(row.get("hammer_price_txt") or "")
+    match = re.fullmatch(r"(?:Hammer price:?\s*)?([A-Z]{3})\s+([0-9][0-9,]*(?:\.\d+)?)", raw)
+    if not match or match[1] != currency:
+        return None
+    value = Decimal(match[2].replace(",", ""))
+    try:
+        structured = row.get("hammer_price")
+        if structured is not None and Decimal(str(structured).replace(",", "")) != value:
+            return None
+    except InvalidOperation:
+        return None
+    return format(value, "f") if 0 < value <= realised else None
 
 
 def archive_catalogues(html):
@@ -153,35 +161,9 @@ def catalogue_sales(url, fetch, artists, excluded, start, cutoff):
             rows = online_catalogue_tail(data, total, rows, fetch)
         except SOURCE_ERRORS as exc:
             errors.append({"url": url, "error": str(exc)})
-    if not online and total > len(rows):
-        endpoint = data.get("lot_search_api_endpoint") or {}
-        params = endpoint.get("parameters") or {}
-        # The public page supplies the sale identifiers and the page size.
-        if endpoint.get("path", "").lstrip("/") != urlsplit(PAGINATION).path.lstrip("/") or not all(
-                str(params.get(key, "")) for key in ("saleid", "salenumber", "saleroomcode")):
-            errors.append({"url": url, "error": "Missing historical catalogue pagination"})
-        else:
-            page_size = int(params.get("pagesize") or 0)
-            if not 0 < page_size <= 200 or page_size != len(rows) or total > 10000:
-                raise loader.PipelineError("Unexpected historical catalogue page size")
-            for page_number in range(2, (total + page_size - 1) // page_size + 1):
-                query = urlencode({
-                    "language": "en", "pagesize": page_size, "saleid": params["saleid"],
-                    "salenumber": params["salenumber"], "saleroomcode": params["saleroomcode"],
-                    "page": page_number, "sortby": "lotnumber", "saletype": "Sale",
-                })
-                page_url = f"{PAGINATION}?{query}"
-                try:
-                    following = json.loads(loader.page(fetch, page_url))
-                    additional = following.get("lots")
-                    if (following.get("total_hits_filtered") != total
-                            or not isinstance(additional, list) or not additional
-                            or any(not isinstance(row, dict) for row in additional)):
-                        raise loader.PipelineError("Invalid following historical catalogue page")
-                    rows.extend(additional)
-                except SOURCE_ERRORS as exc:
-                    errors.append({"url": page_url, "error": str(exc)})
-    if len({row.get("object_id") for row in rows}) != total:
+    if not online:
+        rows, errors = loader.live_catalogue_rows(data, url, fetch)
+    if online and len({row.get("object_id") for row in rows}) != total:
         errors.append({"url": url, "error": "Catalogue unique lot count differs from reported total"})
     observations = []
     for row in rows:
@@ -205,7 +187,8 @@ def catalogue_sales(url, fetch, artists, excluded, start, cutoff):
             continue
         if not (in_window and price.is_finite() and price > 0):
             continue
-        technique = painting_technique(row.get("description_txt") or "")
+        description = loader.plain_text(row.get("description_txt") or "")
+        technique = loader.painting_category(description)
         raw_price = loader.plain_text(row.get("price_realised_txt") or "")
         currencies = set(re.findall(r"\b[A-Z]{3}\b", raw_price))
         currency = next(iter(currencies)) if len(currencies) == 1 else currency_default if not currencies else ""
@@ -214,8 +197,11 @@ def catalogue_sales(url, fetch, artists, excluded, start, cutoff):
         observations.append((name, dates, dict(
             historical_lot_id=identity, title=loader.plain_text(row.get("title_secondary_txt") or ""),
             medium=technique, sale_date=date.isoformat(), currency=currency,
+            sold_at_utc=loader.utc_text(sold_at) if online else None,
             price=format(price.normalize(), "f"), price_raw=raw_price,
             lot_url=lot_url, catalogue_url=url, sale_format="online" if online else "live",
+            dimensions_raw=loader.dimensions_text(description),
+            hammer_price=verified_hammer(row, currency, price),
         )))
     return observations, errors
 
@@ -233,22 +219,28 @@ def stats(sales):
     return {"count": len(values), **{key: format(value.normalize(), "f") for key, value in summary.items()}}
 
 
-def build_history(lots, fetch, now=loader.utc_now, workers=4):
+def build_history(lots, fetch, now=loader.utc_now, workers=4, deadline=None):
     if not lots:
         raise loader.PipelineError("Snapshot contains no lots")
     cutoff = min(loader.utc_datetime(row["collected_at_utc"]) for row in lots)
+    if deadline is not None:
+        loader.check_deadline(deadline, now)
     start = five_years_before(cutoff)
     artists = {artist_identity(row["artist"])[0] for row in lots}
     excluded = {row["lot_id"] for row in lots}
     months = list(archive_months(start, cutoff))
 
     def find_catalogues(url):
+        if deadline is not None and now() >= deadline:
+            return [], []
         try:
             return list(archive_catalogues(loader.page(fetch, url))), []
         except SOURCE_ERRORS as exc:
             return [], [{"url": url, "error": str(exc)}]
 
     def read_catalogue(url):
+        if deadline is not None and now() >= deadline:
+            return [], []
         try:
             return catalogue_sales(url, fetch, artists, excluded, start, cutoff)
         except SOURCE_ERRORS as exc:
@@ -267,23 +259,44 @@ def build_history(lots, fetch, now=loader.utc_now, workers=4):
                 key = (sale["sale_format"], sale["historical_lot_id"])
                 by_artist[name].setdefault(key, (dates, sale))
     briefs = []
+    if deadline is not None:
+        loader.check_deadline(deadline, now)
     for row in lots:
         name, dates = artist_identity(row["artist"])
         related = [sale for match, sale in by_artist[name].values()
                    if all(left == right for left, right in zip(dates, match))]
         related.sort(key=lambda sale: (sale["sale_date"], sale["historical_lot_id"]))
         currencies = defaultdict(list)
+        comparable = defaultdict(list)
+        target_area = area_cm2(row.get("dimensions_raw", ""))
+        target_medium = loader.PAINTING.fullmatch(row.get("medium_raw", ""))
         for sale in related:
             currencies[sale["currency"]].append(sale)
+            past_area = area_cm2(sale["dimensions_raw"])
+            past_medium = loader.PAINTING.fullmatch(sale["medium"])
+            if (sale["hammer_price"] and target_area and past_area and target_medium and past_medium
+                    and target_medium["paint"].casefold() == past_medium["paint"].casefold()
+                    and Decimal("0.5") <= past_area / target_area <= 2):
+                comparable[sale["currency"]].append({
+                    key: sale[key] for key in ("title", "medium", "dimensions_raw", "sale_date",
+                                               "currency", "hammer_price", "lot_url", "catalogue_url")
+                } | {"price": sale["hammer_price"]})
         briefs.append({"lot_id": row["lot_id"], "artist": row["artist"], "category": "painting",
                        "available_sales_count": len(related),
                        "groups": {code: stats(currencies[code]) for code in sorted(currencies)},
+                       "hammer_comparables": {
+                           "price_basis": "hammer_price",
+                           "status": "available" if comparable else "unavailable",
+                           "groups": {code: stats(comparable[code]) for code in sorted(comparable)},
+                           "sales": [sale for code in sorted(comparable) for sale in comparable[code]],
+                       },
                        "sales": related})
     return {
-        "schema_version": 1, "source_scope": "christies_public_painting_catalogues",
+        "schema_version": 2, "source_scope": "christies_public_painting_catalogues",
         "price_basis": "price_realised", "includes_buyer_premium": True,
         "window_start_utc": loader.utc_text(start), "cutoff_utc": loader.utc_text(cutoff),
         "generated_at_utc": loader.utc_text(now()), "archive_months_requested": len(months),
+        "session_start_utc": loader.utc_text(deadline) if deadline is not None else None,
         "catalogues_requested": len(catalogues), "source_errors": errors,
         "coverage_status": "partial" if errors else "scanned" if catalogues else "no_catalogues_found",
         "lots": briefs,
@@ -294,25 +307,16 @@ def history_for_snapshot(snapshot, fetch, now=loader.utc_now):
     with FileLock(snapshot.absolute().parent / ".collections.lock", timeout=30):
         if not snapshot.is_dir() or loader.is_link(snapshot) or snapshot.name.endswith(".incomplete"):
             raise loader.PipelineError("Select a completed snapshot")
-        original = loader.hash_files(snapshot)
         lots = loader.read_csv(snapshot / "lots.csv", loader.LOT_FIELDS)
+        original = loader.hash_files(snapshot)
     report = build_history(lots, fetch, now)
     with FileLock(snapshot.absolute().parent / ".collections.lock", timeout=30):
         if not snapshot.is_dir() or loader.is_link(snapshot) or loader.hash_files(snapshot) != original:
             raise loader.PipelineError("Snapshot changed while collecting artist history")
-        manifest = snapshot / loader.MANIFEST
-        baseline = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
-        path = snapshot / loader.HISTORY_FILE
-        temp = snapshot.parent / f".history-{uuid4().hex}.tmp"
-        try:
-            with temp.open("x", encoding="utf-8", newline="\n") as file:
-                json.dump(report, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-            temp.replace(path)
-            if baseline.get("files") == original:
-                loader.write_manifest(snapshot, loader.utc_datetime(baseline["session_start_utc"]))
-        finally:
-            temp.unlink(missing_ok=True)
+        report["purpose"] = "retrospective_backfill"
+        report["session_start_utc"] = lots[0]["session_start_utc"] or None
+        path = snapshot.with_name(snapshot.name + loader.BACKFILL_SUFFIX)
+        loader.write_json(path, report)
     return path
 
 
@@ -339,7 +343,7 @@ def main(argv=None):
     print(f"Historical coverage: {report['coverage_status']}; "
           f"catalogues checked: {report['catalogues_requested']}; "
           f"source errors: {len(report['source_errors'])}")
-    return 0
+    return 0 if report["coverage_status"] == "scanned" else 1
 
 
 if __name__ == "__main__":

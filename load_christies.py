@@ -12,19 +12,20 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 import requests
 from bs4 import BeautifulSoup
 from filelock import FileLock, Timeout
-from PIL import Image
+from PIL import Image, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 BASE = "https://www.christies.com"
 CALENDAR = BASE + "/en/calendar"
+PAGINATION = BASE + "/api/discoverywebsite/auctionpages/lotsearch"
 ART_AUCTION_TITLE = re.compile(
     r"\b(?:paintings?|old masters|contemporary art|modern art|(?:20th|21st) century)\b", re.I,
 )
@@ -39,9 +40,13 @@ ESTIMATE_FIELDS = (
     "lot_id", "estimate_low", "estimate_high", "estimate_currency", "estimate_raw",
     "collected_at_utc",
 )
-MEDIUM = re.compile(
-    r"(?:oil|acrylic|tempera) on (?:(?:unprimed |primed |raw )?(?:canvas|linen)"
-    r"|(?:(?:wood|wooden|artist['’]s) )?panel|masonite)"
+PAINTING = re.compile(
+    r"(?P<paint>oil|acrylic|tempera|gouache|watercolou?r|distemper|encaustic|casein)"
+    r"(?:\s+and\s+(?:oil|acrylic|tempera|gouache|watercolou?r|distemper|encaustic|casein"
+    r"|marker|graphite|charcoal|pastel|ink))*\s+(?:on|over)\s+"
+    r"(?P<support>(?:unprimed |primed |raw )?(?:canvas|linen)|(?:wood(?:en)? |artist['’]s )?panel"
+    r"|masonite|wood|paper|paperboard|cardboard|board|copper)"
+    r"(?:\s+(?:laid down|mounted) on (?:canvas|linen|board|panel))?"
     r"(?:,\s*(?:in (?:the )?artist['’]s frame|in \w+ parts))?\.?", re.I,
 )
 DIMENSIONS = re.compile(r"\d.*\s[x×]\s.*\d.*(?:\bin\.|\bcm\b|\bmm\b)", re.I)
@@ -52,6 +57,7 @@ IMAGE_HOSTS = {"www.christies.com", "www.christies-media.com",
 MAX_BODY = 25 * 1024 * 1024
 MANIFEST = "collection.json"
 HISTORY_FILE = "artist_history.json"
+BACKFILL_SUFFIX = ".history-backfill.json"
 
 
 class PipelineError(Exception):
@@ -60,6 +66,14 @@ class PipelineError(Exception):
 
 class AuctionStatusError(PipelineError):
     """The source cannot confirm that the auction is still upcoming."""
+
+class HistoryReadinessError(PipelineError):
+    """The run could not produce a complete pre-auction history."""
+
+class DeadlineError(PipelineError):
+    """The selected session no longer has a pre-auction collection window."""
+
+
 
 
 def utc_datetime(value):
@@ -82,7 +96,7 @@ def utc_now():
 
 def check_deadline(start, now):
     if now() >= start:
-        raise PipelineError(f"Session deadline missed ({utc_text(start)})")
+        raise DeadlineError(f"Session deadline missed ({utc_text(start)})")
 
 
 def checked_url(value, hosts):
@@ -140,8 +154,10 @@ def component(html, name):
     raise PipelineError(f"Missing Christie’s component: {name}")
 
 
-def confirm_upcoming(status, source):
-    if any(status.get(key) is not False for key in ("is_in_progress", "is_auction_over")):
+def confirm_upcoming(status, source, allow_live_sale=False):
+    in_progress = status.get("is_in_progress")
+    if (status.get("is_auction_over") is not False
+            or not (in_progress is False or (in_progress is True and allow_live_sale))):
         raise AuctionStatusError(f"Upcoming auction status is unconfirmed or conflicts with time: {source}")
 
 
@@ -150,7 +166,7 @@ def live_auction(html, source):
     status = auction.get("auction_status") or {}
     if auction.get("event_type") != "Sale":
         raise PipelineError("This loader requires a live auction")
-    confirm_upcoming(status, source)
+    confirm_upcoming(status, source, allow_live_sale=True)
     if not all(re.fullmatch(r"[A-Za-z0-9]+", auction.get(key) or "")
                for key in ("sale_id", "sale_number", "sale_room_code")):
         raise PipelineError("Missing auction identifiers")
@@ -159,24 +175,37 @@ def live_auction(html, source):
 
 def numeric_sessions(status):
     for session in status.get("sessions") or []:
-        bounds = re.fullmatch(r"Lots?\s+(\d+)(?:\s*[-–]\s*(\d+))?",
+        bounds = re.fullmatch(r"Lots?\s+([0-9]+[A-Z]*)(?:\s*[-–—]\s*([0-9]+[A-Z]*))?",
                               session.get("lot_txt") or "", re.I)
         if bounds:
-            yield int(bounds[1]), int(bounds[2] or bounds[1]), session
+            low, high = parse_lot_number(bounds[1]), parse_lot_number(bounds[2] or bounds[1])
+            if low is not None and high is not None and low <= high:
+                yield low, high, session
 
 
-def confirm_schedule(html, source, lower, upper, expected):
+def confirm_schedule(html, source, lower, upper, expected, now=utc_now):
     auction, status = live_auction(html, source)
     if status.get("sessions") == []:
         official = utc_datetime(status.get("start_date"))
     else:
         matching = [session for low, high, session in numeric_sessions(status)
-                    if low <= lower <= upper <= high]
+                    if in_lot_range(lower, low, high) and in_lot_range(upper, low, high)]
         if len(matching) != 1:
             raise PipelineError("Official schedule does not identify a single session for the lot range")
         official = utc_datetime(matching[0].get("date_time_universal"))
     if expected is not None and official != expected:
         raise PipelineError(f"Session start conflicts with official schedule ({utc_text(official)})")
+    earlier_starts = set()
+    observed = now()
+    if status.get("is_in_progress") is True and observed < official:
+        for low, high, session in numeric_sessions(status):
+            if high < lower or low > upper or (
+                    low[1] == high[1] and lower[1] == upper[1] and low[1] != lower[1]):
+                when = utc_datetime(session.get("date_time_universal"))
+                if when < official and when <= observed:
+                    earlier_starts.add(when)
+    confirm_upcoming(status, source, allow_live_sale=bool(earlier_starts))
+    auction["earlier_session_starts"] = earlier_starts
     return auction, official
 
 
@@ -190,14 +219,30 @@ def section_text(node):
         tag.decompose()
     for tag in node.find_all("br"):
         tag.replace_with("\n")
-    for tag in node.find_all(["p", "li"]):
+    for tag in node.find_all(["p", "li", "div", "tr", "td", "th"]):
         tag.insert_after("\n")
     return "\n".join(line for raw in node.get_text().splitlines() if (line := " ".join(raw.split())))
 
 
 def painting_medium(text):
-    matches = [line for line in text.splitlines() if MEDIUM.fullmatch(line)]
+    line = painting_category(text)
+    if not line:
+        return ""
+    match = PAINTING.fullmatch(line)
+    return line if (
+        match["paint"].lower() in {"oil", "acrylic", "tempera"}
+        and not re.search(r"\b(?:mounted|laid down)\b", line, re.I)
+        and re.search(r"\b(?:canvas|linen|panel|masonite)\b", match["support"], re.I)
+    ) else ""
+
+
+def painting_category(text):
+    matches = [line for line in text.splitlines() if PAINTING.fullmatch(line)]
     return matches[0] if len(matches) == 1 else ""
+
+
+def dimensions_text(description):
+    return "\n".join(line for line in description.splitlines() if DIMENSIONS.search(line))
 
 
 def matching_line(text, pattern):
@@ -229,11 +274,24 @@ def lot_identity(url):
 
 
 def lot_number(row):
-    value = str(row.get("lot_id_txt", "")).strip()
-    return int(value) if re.fullmatch(r"[0-9]+", value) else None
+    return parse_lot_number(str(row.get("lot_id_txt", "")))
 
 
-def reject_realised(row):
+def parse_lot_number(value):
+    match = re.fullmatch(r"([0-9]+)([A-Z]*)", value.strip(), re.I | re.ASCII)
+    return (int(match[1]), match[2].upper()) if match and int(match[1]) else None
+
+
+def in_lot_range(number, low, high):
+    return (number is not None and low <= number <= high
+            and (low[1] != high[1] or not low[1] or number[1] == low[1]))
+
+
+def lot_label(number):
+    return f"{number[0]}{number[1]}"
+
+
+def reject_realised(row, earlier_starts=()):
     amount = row.get("price_realised")
     published = row.get("price_realised_txt") or ""
     if amount not in (None, ""):
@@ -246,8 +304,11 @@ def reject_realised(row):
     for match in re.findall(r"\d[\d,.]*", published):
         if any(digit in "123456789" for digit in match):
             raise PipelineError("Published realised price")
-    if any(row.get(key) for key in ("lot_withdrawn", "is_unsold", "is_auction_over", "is_in_progress")):
+    if any(row.get(key) for key in ("lot_withdrawn", "is_unsold", "is_auction_over")):
         raise PipelineError("Lot is withdrawn, unsold, closed or in progress")
+    if row.get("is_in_progress"):
+        if not earlier_starts or utc_datetime(row.get("start_date")) not in earlier_starts:
+            raise PipelineError("Lot is in progress")
 
 
 def estimate_data(lot, labels):
@@ -266,6 +327,16 @@ def estimate_data(lot, labels):
         raise PipelineError("Estimate bounds are missing or invalid") from exc
     if not low.is_finite() or not high.is_finite() or not 0 < low <= high:
         raise PipelineError("Estimate bounds are invalid")
+    display = re.fullmatch(
+        r"\s*(?:[A-Z]{3}\s*)?(?P<low>[0-9][0-9,. ]*?)\s*[-–—−]\s*"
+        r"(?:[A-Z]{3}\s*)?(?P<high>[0-9][0-9,. ]*?)(?:\s*[A-Z]{3})?\s*", raw)
+    try:
+        shown = tuple(Decimal(display[key].replace(",", "").replace(" ", ""))
+                      for key in ("low", "high")) if display else ()
+    except InvalidOperation:
+        shown = ()
+    if shown != (low, high):
+        raise PipelineError("Estimate bounds do not match the public display")
     return dict(estimate_low=format(low, "f"), estimate_high=format(high, "f"),
                 estimate_currency=currencies.pop(), estimate_raw=raw)
 
@@ -280,7 +351,7 @@ def card_data(html, identity, auction):
             if any(str(sale.get(key)) != str(auction[key]) for key in
                    ("sale_id", "sale_number", "sale_room_code")):
                 raise PipelineError("Lot belongs to another or unknown auction")
-            confirm_upcoming(sale, f"lot {identity}")
+            confirm_upcoming(sale, f"lot {identity}", bool(auction.get("earlier_session_starts")))
             return lot, header.get("labels") or {}
     raise PipelineError("No header record for the lot object ID")
 
@@ -341,7 +412,7 @@ def collection_name(auction, args, collected):
     title = plain_text(auction.get("title") or "Christie's live auction")
     title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", title)
     title = " ".join(title.split())[:65].rstrip(" .") or "Christie's live auction"
-    return (f"{title} - {auction['sale_number']} - lots {args.lot_from}-{args.lot_to}"
+    return (f"{title} - {auction['sale_number']} - lots {lot_label(args.lot_from)}-{lot_label(args.lot_to)}"
             f" - {collected:%Y-%m-%d %H-%M-%S} UTC")
 
 
@@ -373,9 +444,38 @@ def hash_files(folder):
     return hashes
 
 
-def write_manifest(folder, start):
-    payload = {"version": 1, "session_start_utc": utc_text(start), "files": hash_files(folder)}
-    (folder / MANIFEST).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+def write_json(path, payload):
+    temp = path.with_name(f".{uuid4().hex}.tmp")
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def write_manifest(folder, start, ready_at=None):
+    payload = {"version": 1, "session_start_utc": utc_text(start),
+               "analysis_ready_at_utc": utc_text(ready_at) if ready_at else None,
+               "files": hash_files(folder)}
+    write_json(folder / MANIFEST, payload)
+
+
+def checked_history(history, lots, start, ready_at):
+    ids = [row["lot_id"] for row in lots]
+    if (history.get("schema_version") != 2 or history.get("coverage_status") != "scanned"
+            or history.get("source_errors") != []
+            or history.get("session_start_utc") != utc_text(start)
+            or [row.get("lot_id") for row in history.get("lots", [])] != ids
+            or any("hammer_comparables" not in row for row in history.get("lots", []))):
+        raise HistoryReadinessError("Historical coverage or lot alignment is incomplete")
+    observed = [utc_datetime(row["collected_at_utc"]) for row in lots]
+    generated = utc_datetime(history.get("generated_at_utc"))
+    if not (utc_datetime(history.get("cutoff_utc")) == min(observed)
+            and max(observed) <= generated <= ready_at < start
+            and all(utc_datetime(row["session_start_utc"]) == start for row in lots)):
+        raise HistoryReadinessError("History timestamps violate the shared session deadline")
 
 
 def cleanup_expired(root, current, now):
@@ -410,6 +510,59 @@ def free_name(root, name):
     return destination
 
 
+PRICE_WORD = re.compile(r"\b(?:estim(?:ate|ated|ation)|bid(?:ding)?|price|reserve|hammer|realised|realized)\b", re.I)
+SENSITIVE_VALUE = re.compile(
+    r"\b(?:usd|gbp|eur|chf|hkd|cny|jpy|aed|aud|cad|dollars?|pounds?|euros?)\b|[$€£¥]|https?://|www\."
+    r"|\b\d{1,3}(?:[, ]\d{3})+\b|\b\d{5,}\b", re.I,
+)
+STANDALONE_AMOUNT = re.compile(r"\s*[\d,. ]+(?:\s*[-–—−]\s*[\d,. ]+)?\s*")
+BLIND_FIELDS = ("artist", "title", "creation_date_raw", "medium_raw", "dimensions_raw",
+                "details_raw", "provenance_raw", "exhibited_raw", "literature_raw",
+                "lot_essay_raw", "condition_raw")
+
+
+def blind_text(value, identity_field=False):
+    retained = []
+    after_price_label = False
+    for line in value.replace(r"\n", "\n").splitlines():
+        if not line.strip():
+            continue
+        price_label = not identity_field and bool(PRICE_WORD.search(line))
+        if not (price_label or SENSITIVE_VALUE.search(line)
+                or (after_price_label and STANDALONE_AMOUNT.fullmatch(line))):
+            retained.append(line)
+        after_price_label = price_label
+    return "\n".join(retained)
+
+
+def write_blind_packet(folder, snapshot, lots, history):
+    images = folder / "images"
+    images.mkdir(parents=True)
+    by_id = {row["lot_id"]: row for row in history["lots"]}
+    packet = []
+    for index, row in enumerate(lots, 1):
+        sample_id = f"work-{index:02d}"
+        image_path = f"images/{sample_id}.png"
+        with Image.open(snapshot / row["image_path"]) as source:
+            clean = ImageOps.exif_transpose(source).convert("RGB")
+            clean.info.clear()
+            clean.save(folder / image_path, format="PNG")
+        comparables = by_id[row["lot_id"]]["hammer_comparables"]
+        fields = ("title", "medium", "dimensions_raw", "sale_date", "currency", "hammer_price")
+        packet.append({
+            "sample_id": sample_id, "image_path": image_path,
+            **{key: blind_text(row[key], identity_field=key in {"artist", "title"}) for key in BLIND_FIELDS},
+            "hammer_comparables": {
+                "price_basis": "hammer_price", "status": comparables["status"],
+                "groups": comparables["groups"],
+                "sales": [{key: blind_text(sale[key], identity_field=key == "title")
+                           if key in {"title", "medium", "dimensions_raw"}
+                           else sale[key] for key in fields} for sale in comparables["sales"]],
+            },
+        })
+    write_json(folder / "lots.json", {"prediction_deadline_utc": history["session_start_utc"], "lots": packet})
+
+
 def archive_used_lots(snapshot, lot_ids):
     if not lot_ids:
         raise PipelineError("Supply at least one --lot-id")
@@ -418,12 +571,26 @@ def archive_used_lots(snapshot, lot_ids):
         if not snapshot.is_dir() or is_link(snapshot) or snapshot.name.endswith(".incomplete"):
             raise PipelineError("Select a completed snapshot")
         hashes = hash_files(snapshot)
-        lots = [row for row in read_csv(snapshot / "lots.csv", LOT_FIELDS) if row["lot_id"] in lot_ids]
+        manifest_path = snapshot / MANIFEST
+        if not manifest_path.is_file() or HISTORY_FILE not in hashes:
+            raise HistoryReadinessError("Snapshot is not ready for analysis")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not manifest.get("analysis_ready_at_utc") or manifest.get("files") != hashes:
+            raise HistoryReadinessError("Snapshot is not ready for analysis or has changed")
+        ready_at = utc_datetime(manifest["analysis_ready_at_utc"])
+        start = utc_datetime(manifest["session_start_utc"])
+        all_lots = read_csv(snapshot / "lots.csv", LOT_FIELDS)
+        history = json.loads((snapshot / HISTORY_FILE).read_text(encoding="utf-8"))
+        checked_history(history, all_lots, start, ready_at)
+        lots = [row for row in all_lots if row["lot_id"] in lot_ids]
         estimates = [row for row in read_csv(snapshot / "estimates.csv", ESTIMATE_FIELDS)
                      if row["lot_id"] in lot_ids]
         for rows in (lots, estimates):
             if len(rows) != len(lot_ids) or {row["lot_id"] for row in rows} != lot_ids:
                 raise PipelineError("Each requested lot must occur once in both CSV files")
+        timestamps = {row["lot_id"]: row["collected_at_utc"] for row in estimates}
+        if any(row["collected_at_utc"] != timestamps[row["lot_id"]] for row in lots):
+            raise PipelineError("Catalog and estimate timestamps disagree")
         for row in lots:
             photo = row["image_path"]
             if photo not in hashes or not photo.startswith(f"images/{row['lot_id']}."):
@@ -436,19 +603,30 @@ def archive_used_lots(snapshot, lot_ids):
             raise PipelineError("The used archive must be a local directory inside the collection folder")
         name = f"{snapshot.name} - used"
         staging = archive / f".archive-{uuid4().hex[:8]}.incomplete"
-        (staging / "images").mkdir(parents=True)
+        audit = staging / "audit"
+        (audit / "images").mkdir(parents=True)
         try:
-            write_csv(staging / "lots.csv", LOT_FIELDS, lots)
-            write_csv(staging / "estimates.csv", ESTIMATE_FIELDS, estimates)
+            write_csv(audit / "lots.csv", LOT_FIELDS, lots)
+            write_csv(audit / "estimates.csv", ESTIMATE_FIELDS, estimates)
             for row in lots:
-                shutil.copyfile(snapshot / row["image_path"], staging / row["image_path"])
+                shutil.copyfile(snapshot / row["image_path"], audit / row["image_path"])
             if "errors.txt" in hashes:
-                shutil.copyfile(snapshot / "errors.txt", staging / "errors.txt")
-            if HISTORY_FILE in hashes:
-                history = json.loads((snapshot / HISTORY_FILE).read_text(encoding="utf-8"))
-                history["lots"] = [row for row in history["lots"] if row["lot_id"] in lot_ids]
-                (staging / HISTORY_FILE).write_text(
-                    json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                shutil.copyfile(snapshot / "errors.txt", audit / "errors.txt")
+            history["lots"] = [row for row in history["lots"] if row["lot_id"] in lot_ids]
+            write_json(audit / HISTORY_FILE, history)
+            write_json(audit / "source_collection.json", manifest)
+            write_json(audit / "sample_map.json", {f"work-{i:02d}": row["lot_id"]
+                                                   for i, row in enumerate(lots, 1)})
+            write_json(audit / "archive_time.json", {"archived_at_utc": utc_text(utc_now())})
+            write_blind_packet(staging / "blind", snapshot, lots, history)
+            arbiter = staging / "arbiter"
+            arbiter.mkdir()
+            by_id = {row["lot_id"]: row for row in estimates}
+            write_json(arbiter / "estimates.json", {"lots": [
+                {"sample_id": f"work-{i:02d}", **{key: by_id[row["lot_id"]][key]
+                 for key in ("estimate_low", "estimate_high", "estimate_currency")}}
+                for i, row in enumerate(lots, 1)
+            ]})
             destination = free_name(archive, name)
             staging.rename(destination)
         finally:
@@ -466,7 +644,62 @@ def write_log(path, log):
         f"{url}\t{stage}\t{reason}\n" for url, stage, reason in log), encoding="utf-8")
 
 
-def candidate_rows(args, fetch, auction, log):
+def live_catalogue_rows(data, url, fetch):
+    initial = data.get("lots")
+    if not isinstance(initial, list) or any(not isinstance(row, dict) for row in initial):
+        raise PipelineError("Invalid catalogue lot list")
+    rows = list(initial)
+    total = data.get("total_hits_filtered")
+    if type(total) is not int or total < len(rows):
+        raise PipelineError("Invalid catalogue lot count")
+    errors = []
+    if total > len(rows):
+        endpoint = data.get("lot_search_api_endpoint") or {}
+        params = endpoint.get("parameters") or {}
+        # The public page supplies the sale identifiers and the page size.
+        if endpoint.get("path", "").lstrip("/") != urlsplit(PAGINATION).path.lstrip("/") or not all(
+                str(params.get(key, "")) for key in ("saleid", "salenumber", "saleroomcode")):
+            errors.append({"url": url, "error": "Missing historical catalogue pagination"})
+        else:
+            try:
+                page_size = int(params.get("pagesize") or 0)
+            except (TypeError, ValueError) as exc:
+                raise PipelineError("Invalid historical catalogue page size") from exc
+            if not 0 < page_size <= 200 or page_size != len(rows) or total > 10000:
+                raise PipelineError("Unexpected historical catalogue page size")
+            for page_number in range(2, (total + page_size - 1) // page_size + 1):
+                query = urlencode({
+                    "language": "en", "pagesize": page_size, "saleid": params["saleid"],
+                    "salenumber": params["salenumber"], "saleroomcode": params["saleroomcode"],
+                    "page": page_number, "sortby": "lotnumber", "saletype": "Sale",
+                })
+                page_url = f"{PAGINATION}?{query}"
+                try:
+                    following = json.loads(page(fetch, page_url))
+                    if not isinstance(following, dict):
+                        raise PipelineError("Invalid following catalogue page")
+                    additional = following.get("lots")
+                    if (following.get("total_hits_filtered") != total
+                            or not isinstance(additional, list) or not additional
+                            or any(not isinstance(row, dict) for row in additional)):
+                        raise PipelineError("Invalid following historical catalogue page")
+                    rows.extend(additional)
+                except (PipelineError, requests.RequestException, UnicodeError, ValueError) as exc:
+                    errors.append({"url": page_url, "error": str(exc)})
+    identities = {str(row.get("object_id") or "") for row in rows}
+    if "" in identities or len(rows) != total or len(identities) != total:
+        errors.append({"url": url, "error": "Catalogue unique lot count differs from reported total"})
+    return rows, errors
+
+
+def current_catalogue_rows(html, url, fetch):
+    rows, errors = live_catalogue_rows(component(html, "lots")["data"], url, fetch)
+    if errors:
+        raise PipelineError(f"Unable to read full catalog: {errors[0]['error']}")
+    return rows
+
+
+def candidate_rows(args, fetch, auction, log, now=utc_now):
     if args.lot_urls_file is not None:
         urls = args.lot_urls_file.read_text(encoding="utf-8-sig").splitlines()
         rows = []
@@ -483,10 +716,10 @@ def candidate_rows(args, fetch, auction, log):
         return rows
     html = page(fetch, args.catalog_url)
     catalog_sale, _ = confirm_schedule(html, args.catalog_url, args.lot_from,
-                                       args.lot_to, args.session_start)
+                                       args.lot_to, args.session_start, now)
     if any(catalog_sale[key] != auction[key] for key in ("sale_id", "sale_number", "sale_room_code")):
         raise PipelineError("Catalog and schedule belong to different auctions")
-    rows = component(html, "lots")["data"].get("lots")
+    rows = current_catalogue_rows(html, args.catalog_url, fetch)
     if not isinstance(rows, list) or not rows:
         raise PipelineError("Empty catalog. Supply manually collected URLs with --lot-urls-file.")
     return [(row, urljoin(args.catalog_url, row.get("url") or ""), None, None) for row in rows]
@@ -503,7 +736,7 @@ def calendar_auctions(html):
             yield BASE + url.path.rstrip("/")
 
 
-def discover_and_collect(args, fetch, now):
+def discover_and_collect(args, fetch, now, history_builder=None):
     today = now()
     seen = set()
     last_error = None
@@ -531,7 +764,7 @@ def discover_and_collect(args, fetch, now):
                         upcoming.append((start, catalog, overview, None, None))
                 for low, high, session in numeric_sessions(status):
                     start = utc_datetime(session.get("date_time_universal"))
-                    if start > now() and high - low >= 9:
+                    if start > now() and high[0] - low[0] >= 9:
                         upcoming.append((start, catalog, overview, low, high))
             except fetch_errors as exc:
                 last_error = exc
@@ -541,7 +774,7 @@ def discover_and_collect(args, fetch, now):
                 check_deadline(start, now)
                 if catalog not in catalogs:
                     preview = page(fetch, catalog)
-                    rows = component(preview, "lots")["data"].get("lots") or []
+                    rows = current_catalogue_rows(preview, catalog, fetch)
                     catalogs[catalog] = [lot_number(row) for row in rows
                                          if painting_medium(plain_text(row.get("description_txt")))]
                 numbers = {number for number in catalogs[catalog] if number is not None}
@@ -549,13 +782,15 @@ def discover_and_collect(args, fetch, now):
                     continue
                 if low is None:
                     low, high = min(numbers), max(numbers)
-                if sum(low <= number <= high for number in numbers) < 10:
+                if sum(in_lot_range(number, low, high) for number in numbers) < 10:
                     continue
                 selection = argparse.Namespace(**(vars(args) | {
                     "catalog_url": catalog, "overview_url": overview,
                     "lot_from": low, "lot_to": high, "session_start": start,
                 }))
-                return collect(selection, fetch, now)
+                return collect(selection, fetch, now, history_builder)
+            except HistoryReadinessError:
+                raise
             except fetch_errors as exc:
                 last_error = exc
                 print(f"Skipping session {overview} ({utc_text(start)}): {exc}", file=sys.stderr)
@@ -565,13 +800,13 @@ def discover_and_collect(args, fetch, now):
     raise PipelineError(message)
 
 
-def collect(args, fetch, now=utc_now):
+def collect(args, fetch, now=utc_now, history_builder=None):
     if args.catalog_url is None:
-        return discover_and_collect(args, fetch, now)
+        return discover_and_collect(args, fetch, now, history_builder)
     if args.session_start is not None:
         check_deadline(args.session_start, now)
     auction, start = confirm_schedule(page(fetch, args.overview_url), args.overview_url,
-                                      args.lot_from, args.lot_to, args.session_start)
+                                      args.lot_from, args.lot_to, args.session_start, now)
     check_deadline(start, now)
     args = argparse.Namespace(**(vars(args) | {"session_start": start}))
     log = []
@@ -580,21 +815,21 @@ def collect(args, fetch, now=utc_now):
     (staging / "images").mkdir(parents=True)
     lots, estimates, seen = [], [], set()
     try:
-        candidates = candidate_rows(args, fetch, auction, log)
-        candidates.sort(key=lambda candidate: lot_number(candidate[0]) or 0)
+        candidates = candidate_rows(args, fetch, auction, log, now)
+        candidates.sort(key=lambda candidate: lot_number(candidate[0]) or (0, ""))
         for row, url, html, labels in candidates:
             check_deadline(start, now)
             number = lot_number(row)
             stage = "catalog"
             try:
-                if number is None or not args.lot_from <= number <= args.lot_to:
+                if not in_lot_range(number, args.lot_from, args.lot_to):
                     raise PipelineError("Lot number outside the selected session range")
                 identity = lot_identity(url)
                 if identity != str(row.get("object_id")):
                     raise PipelineError("Catalog object ID does not match lot URL")
                 if identity in seen:
                     raise PipelineError("Duplicate lot object ID")
-                reject_realised(row)
+                reject_realised(row, auction["earlier_session_starts"])
                 if html is None and not painting_medium(plain_text(row.get("description_txt"))):
                     raise PipelineError("Technique excluded by the catalog painting filter")
                 stage = "card"
@@ -628,10 +863,10 @@ def collect(args, fetch, now=utc_now):
             image_path = f"images/{identity}{extension}"
             (staging / image_path).write_bytes(body)
             lot_row = dict(
-                lot_id=identity, lot_number=number, sale_id=auction["sale_id"],
+                lot_id=identity, lot_number=lot_label(number), sale_id=auction["sale_id"],
                 lot_url=BASE + f"/en/lot/lot-{identity}", artist=artist, title=title,
                 creation_date_raw=matching_line(details, CREATION), medium_raw=medium,
-                dimensions_raw="\n".join(line for line in details.splitlines() if DIMENSIONS.search(line)),
+                dimensions_raw=dimensions_text(details),
                 details_raw=details,
                 provenance_raw=sections.get("provenance", ""),
                 exhibited_raw=sections.get("exhibited", ""),
@@ -653,19 +888,33 @@ def collect(args, fetch, now=utc_now):
             raise PipelineError(f"Only {len(lots)} qualifying lots. Check remaining catalog links "
                                 "or select another upcoming session.")
         write_log(staging / "errors.txt", log)
+        if history_builder is not None:
+            try:
+                history = history_builder(lots, start)
+                write_json(staging / HISTORY_FILE, history)
+                checked_history(history, lots, start, now())
+                confirm_schedule(page(fetch, args.overview_url), args.overview_url,
+                                 args.lot_from, args.lot_to, start, now)
+            except DeadlineError:
+                raise
+            except (PipelineError, OSError, requests.RequestException, UnicodeError, ValueError) as exc:
+                raise HistoryReadinessError(str(exc)) from exc
         with FileLock(args.output_dir / ".collections.lock", timeout=30):
-            write_manifest(staging, start)
+            ready_at = now() if history_builder is not None else None
+            write_manifest(staging, start, ready_at)
             check_deadline(start, now)
             destination = free_name(args.output_dir, name)
             staging.rename(destination)
-            cleanup_expired(args.output_dir, destination, now)
+            if ready_at is not None:
+                cleanup_expired(args.output_dir, destination, now)
     except (PipelineError, OSError, requests.RequestException, UnicodeError, Timeout) as exc:
         if not staging.exists():
             raise
         log_entry(log, args.catalog_url, "snapshot", exc)
         write_log(staging / "errors.txt", log)
         write_manifest(staging, start)
-        raise PipelineError(f"{exc}. Incomplete attempt: {staging}") from exc
+        error_type = type(exc) if isinstance(exc, (HistoryReadinessError, DeadlineError)) else PipelineError
+        raise error_type(f"{exc}. Incomplete attempt: {staging}") from exc
     return destination, len(lots)
 
 
@@ -673,8 +922,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog-url", help="Select a specific auction instead of searching the calendar")
     parser.add_argument("--overview-url", help="Christie's official schedule URL")
-    parser.add_argument("--lot-from", type=int)
-    parser.add_argument("--lot-to", type=int)
+    parser.add_argument("--lot-from", type=parse_lot_number)
+    parser.add_argument("--lot-to", type=parse_lot_number)
     parser.add_argument("--session-start", help="Optional cross-check of the official time in ISO 8601")
     parser.add_argument("--lot-urls-file", type=Path, help="Manual fallback, one lot URL per line")
     parser.add_argument("--output-dir", type=Path, default=Path("snapshots"))
@@ -687,7 +936,7 @@ def parse_args(argv=None):
                                                args.session_start, args.lot_urls_file)):
             parser.error("Supply --catalog-url with manual session options")
         return args
-    if args.lot_from is None or args.lot_to is None or not 0 < args.lot_from <= args.lot_to:
+    if args.lot_from is None or args.lot_to is None or not args.lot_from <= args.lot_to:
         parser.error("Supply a positive and ordered --lot-from / --lot-to range")
     if args.overview_url is None:
         if not args.catalog_url.endswith("/browse-lots"):
@@ -718,20 +967,26 @@ def main(argv=None):
         print(f"Saved used lots: {archive.resolve()}")
         return 0
     args = parse_args(argv)
+    history_builder = None
+    if not args.skip_history:
+        if __name__ == "__main__":
+            sys.modules["load_christies"] = sys.modules[__name__]
+        from artist_history import build_history, fetch_public
+
+        def history_builder(lots, start):
+            print("Scanning five years of Christie’s catalogues...", file=sys.stderr, flush=True)
+            return build_history(lots, fetch_public, deadline=start)
+
     with requests.Session() as session:
         retry = Retry(total=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
         session.mount("https://", HTTPAdapter(max_retries=retry))
         session.headers.update({"Accept-Language": "en-US,en;q=0.9"})
         try:
-            path, count = collect(args, lambda url: fetch_resource(session, url))
+            path, count = collect(args, lambda url: fetch_resource(session, url), history_builder=history_builder)
         except (PipelineError, OSError, requests.RequestException, UnicodeError) as exc:
             print(f"Collection stopped: {exc}", file=sys.stderr)
             return 1
     print(f"Saved {count} lots: {path.resolve()}")
-    if not args.skip_history:
-        from artist_history import main as collect_history
-
-        return collect_history([str(path)])
     return 0
 
 

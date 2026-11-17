@@ -8,10 +8,14 @@ import artist_history as history
 
 
 class HistoryTests(unittest.TestCase):
+    def test_oil_on_vase_is_excluded(self):
+        self.assertEqual(history.painting_technique("Artist<br>Title<br>oil on ceramic vase"), "")
+
     def test_build_groups_verified_paintings_by_artist_and_currency(self):
         target = [
             dict(lot_id="100", artist="HELEN FRANKENTHALER (1928-2011)",
-                 collected_at_utc="2026-11-17T07:00:00Z"),
+                 collected_at_utc="2026-11-17T07:00:00Z", dimensions_raw="10 x 20 cm.",
+                 medium_raw="oil on canvas"),
             dict(lot_id="101", artist="Helen Frankenthaler (1928–2011)",
                  collected_at_utc="2026-11-17T07:01:00Z"),
             dict(lot_id="102", artist="Unrepresented Artist",
@@ -25,11 +29,12 @@ class HistoryTests(unittest.TestCase):
 
         def lot(identity, price, currency="USD", medium="oil on canvas", **extra):
             return dict(object_id=str(identity), title_primary_txt="HELEN FRANKENTHALER (1928-2011)",
-                        description_txt=f"Artist<br>Title<br>{medium}<br>Painted in 1982.",
+                        description_txt=f"Artist<br>Title<br>{medium}<br>10 x 20 cm.<br>Painted in 1982.",
                         price_realised=str(price), price_realised_txt=f"{currency} {price}",
                         start_date="2022-05-13T00:00Z", **extra)
 
-        lots = [lot(1, 100), lot(2, 200), lot(3, 300), lot(4, 400), lot(5, 500, "GBP"),
+        lots = [lot(1, 100, hammer_price_txt="USD 80", hammer_price=80),
+                lot(2, 200), lot(3, 300), lot(4, 400), lot(5, 500, "GBP"),
                 lot(6, 900, medium="screenprint on paper"), lot(7, 0),
                 lot(8, 999, lot_withdrawn=True), lot(100, 1234),
                 dict(lot(9, 999), title_primary_txt="AFTER HELEN FRANKENTHALER"),
@@ -53,6 +58,8 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["groups"]["USD"]["mean"], "250")
         self.assertEqual(rows[0]["groups"]["USD"]["q75"], "325")
         self.assertEqual(rows[0]["groups"]["GBP"]["count"], 1)
+        self.assertEqual(rows[0]["hammer_comparables"]["groups"]["USD"]["median"], "80")
+        self.assertEqual(rows[0]["hammer_comparables"]["sales"][0]["dimensions_raw"], "10 x 20 cm.")
         self.assertEqual(result["window_start_utc"], "2021-11-17T07:00:00Z")
         self.assertEqual(result["cutoff_utc"], "2026-11-17T07:00:00Z")
         self.assertEqual(result["price_basis"], "price_realised")
@@ -87,7 +94,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertIn("page=3", errors[0]["url"])
 
-    def test_history_updates_manifest_and_mark_used_preserves_selected_brief(self):
+    def test_backfill_does_not_modify_snapshot_or_unlock_mark_used(self):
         loader = history.loader
         timestamp = "2026-11-17T07:00:00Z"
         with tempfile.TemporaryDirectory() as folder:
@@ -107,11 +114,12 @@ class HistoryTests(unittest.TestCase):
             path = history.history_for_snapshot(snapshot, lambda _: b"<h1>Auction results</h1>")
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["coverage_status"],
                              "no_catalogues_found")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["purpose"], "retrospective_backfill")
+            self.assertFalse((snapshot / loader.HISTORY_FILE).exists())
             manifest = json.loads((snapshot / loader.MANIFEST).read_text(encoding="utf-8"))
             self.assertEqual(manifest["files"], loader.hash_files(snapshot))
-            used = loader.archive_used_lots(snapshot, {"101"})
-            saved = json.loads((used / loader.HISTORY_FILE).read_text(encoding="utf-8"))
-            self.assertEqual([row["lot_id"] for row in saved["lots"]], ["101"])
+            with self.assertRaises(loader.HistoryReadinessError):
+                loader.archive_used_lots(snapshot, {"101"})
 
     def test_online_catalogue_uses_exact_lot_close_and_cumulative_last_page(self):
         alias = "https://www.christies.com/en/auction/auction-30749/browse-lots"
