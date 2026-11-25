@@ -2,6 +2,7 @@ import io
 import json
 import tempfile
 import unittest
+from pathlib import Path
 from uuid import UUID
 
 from PIL import Image
@@ -66,6 +67,41 @@ class SothebysTests(unittest.TestCase):
             self.assertEqual(blind["hammer_comparables"]["groups"]["USD"]["median"], "120")
             self.assertNotIn("lot_url", blind)
             self.assertTrue((used / "arbiter" / "estimates.json").is_file())
+
+            root = Path(directory)
+            args.skip_history = True
+            old_catalogue, _ = s.collect(args, pages.__getitem__, now=now)
+            modified_catalogue, _ = s.collect(args, pages.__getitem__, now=now)
+            (modified_catalogue / "notes.txt").write_text("Research notes", encoding="utf-8")
+            legacy = root / "older-attempt.incomplete"
+            (legacy / "images").mkdir(parents=True)
+            s.common.write_log(legacy / "errors.txt", [(catalog, "snapshot", "Catalogue failed")])
+            s.common.write_manifest(legacy, s.common.utc_datetime(start))
+            manifest_path = legacy / s.common.MANIFEST
+            legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            del legacy_manifest["source"]
+            s.common.write_json(manifest_path, legacy_manifest)
+
+            christies = root / "other-house"
+            (christies / "images").mkdir(parents=True)
+            s.common.write_manifest(christies, s.common.utc_datetime(start))
+            later_start = "2026-12-10T13:30Z"
+            later_now = lambda: s.common.utc_datetime("2026-12-05T10:00Z")
+            refreshed = {url: payload.replace(start.encode(), later_start.encode()) if url != photo else payload
+                         for url, payload in pages.items()}
+            failed = {**refreshed, photo: b"invalid image"}
+            with self.assertRaises(s.common.PipelineError):
+                s.collect(args, failed.__getitem__, now=later_now)
+            self.assertTrue(old_catalogue.exists())
+
+            fresh, _ = s.collect(args, refreshed.__getitem__, now=later_now)
+            self.assertTrue(fresh.exists())
+            self.assertFalse(snapshot.exists())
+            self.assertFalse(old_catalogue.exists())
+            self.assertFalse(legacy.exists())
+            self.assertTrue(used.exists())
+            self.assertTrue(modified_catalogue.exists())
+            self.assertTrue(christies.exists())
 
     def test_live_cutoff_differs_from_advance_bidding(self):
         cache = {"s": {"state": "PreOpen"}}

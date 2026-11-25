@@ -480,6 +480,19 @@ def checked_history(history, lots, start, ready_at):
         raise HistoryReadinessError("History timestamps violate the shared session deadline")
 
 
+def legacy_snapshot_source(folder, rows):
+    urls = [row["cutoff_source_url"] for row in rows]
+    if not urls and folder.name.endswith(".incomplete") and (folder / "errors.txt").is_file():
+        with (folder / "errors.txt").open(encoding="utf-8", newline="") as log:
+            urls = [row["url"] for row in csv.DictReader(log, delimiter="\t")]
+    hosts = {urlsplit(url).hostname for url in urls}
+    if hosts == {"www.sothebys.com"}:
+        return "sothebys"
+    if hosts == {"www.christies.com"} or not urls:
+        return "christies"
+    return None
+
+
 def cleanup_expired(root, current, now, source="christies"):
     for folder in root.iterdir():
         if folder == current or folder.name == "used" or not folder.is_dir():
@@ -492,14 +505,17 @@ def cleanup_expired(root, current, now, source="christies"):
                 continue
             data = json.loads(manifest.read_text(encoding="utf-8"))
             if (not isinstance(data, dict) or data.get("version") != 1
-                    or data.get("source", "christies") != source
                     or utc_datetime(data.get("session_start_utc")) > now()
                     or data.get("files") != hash_files(folder)):
                 continue
+            rows = []
             if (folder / "lots.csv").exists():
                 rows = read_csv(folder / "lots.csv", LOT_FIELDS)
                 if any(row["session_start_utc"] != data["session_start_utc"] for row in rows):
                     continue
+            snapshot_source = data.get("source") or legacy_snapshot_source(folder, rows)
+            if snapshot_source != source:
+                continue
             shutil.rmtree(folder)
             print(f"Removed expired snapshot: {folder}", file=sys.stderr)
         except (PipelineError, OSError, KeyError, ValueError, csv.Error) as exc:
@@ -923,7 +939,7 @@ def publish_snapshot(args, auction, start, now, history_builder, collect_lots, r
             check_deadline(start, now)
             destination = free_name(args.output_dir, name)
             staging.rename(destination)
-            if ready_at is not None:
+            if ready_at is not None or source == "sothebys":
                 cleanup_expired(args.output_dir, destination, now, source)
     except (PipelineError, OSError, requests.RequestException, UnicodeError, Timeout) as exc:
         if not staging.exists():
