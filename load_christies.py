@@ -107,9 +107,9 @@ def checked_url(value, hosts):
     return value
 
 
-def fetch_resource(session, url):
+def fetch_resource(session, url, hosts=IMAGE_HOSTS):
     for _ in range(5):
-        checked_url(url, IMAGE_HOSTS)
+        checked_url(url, hosts)
         with session.get(url, timeout=(8, 25), stream=True, allow_redirects=False) as response:
             if response.is_redirect:
                 url = urljoin(url, response.headers["Location"])
@@ -371,11 +371,11 @@ def photo_candidates(soup, preview, lot_url):
     return dict.fromkeys(urls)
 
 
-def download_photo(fetch, urls):
+def download_photo(fetch, urls, hosts=IMAGE_HOSTS):
     failures = []
     for url in urls:
         try:
-            body = fetch(checked_url(url, IMAGE_HOSTS))
+            body = fetch(checked_url(url, hosts))
             with Image.open(io.BytesIO(body)) as image:
                 extension = IMAGE_EXTENSIONS.get(image.format)
                 if extension is None or min(image.size) < 100:
@@ -433,8 +433,9 @@ def hash_files(folder):
     entries.pop(MANIFEST, None)
     files = entries
     for photo in images.iterdir():
-        if (is_link(photo) or not photo.is_file() or not photo.stem.isascii()
-                or not photo.stem.isdecimal() or photo.suffix not in IMAGE_EXTENSIONS.values()):
+        if (is_link(photo) or not photo.is_file() or not re.fullmatch(
+                r"(?:[0-9]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})", photo.stem)
+                or photo.suffix not in IMAGE_EXTENSIONS.values()):
             raise PipelineError("Snapshot contains an unexpected image entry")
         files[f"images/{photo.name}"] = photo
     hashes = {}
@@ -455,9 +456,10 @@ def write_json(path, payload):
         temp.unlink(missing_ok=True)
 
 
-def write_manifest(folder, start, ready_at=None):
+def write_manifest(folder, start, ready_at=None, source="christies"):
     payload = {"version": 1, "session_start_utc": utc_text(start),
                "analysis_ready_at_utc": utc_text(ready_at) if ready_at else None,
+               "source": source,
                "files": hash_files(folder)}
     write_json(folder / MANIFEST, payload)
 
@@ -478,7 +480,7 @@ def checked_history(history, lots, start, ready_at):
         raise HistoryReadinessError("History timestamps violate the shared session deadline")
 
 
-def cleanup_expired(root, current, now):
+def cleanup_expired(root, current, now, source="christies"):
     for folder in root.iterdir():
         if folder == current or folder.name == "used" or not folder.is_dir():
             continue
@@ -490,6 +492,7 @@ def cleanup_expired(root, current, now):
                 continue
             data = json.loads(manifest.read_text(encoding="utf-8"))
             if (not isinstance(data, dict) or data.get("version") != 1
+                    or data.get("source", "christies") != source
                     or utc_datetime(data.get("session_start_utc")) > now()
                     or data.get("files") != hash_files(folder)):
                 continue
@@ -809,79 +812,95 @@ def collect(args, fetch, now=utc_now, history_builder=None):
                                       args.lot_from, args.lot_to, args.session_start, now)
     check_deadline(start, now)
     args = argparse.Namespace(**(vars(args) | {"session_start": start}))
+    def recheck():
+        confirm_schedule(page(fetch, args.overview_url), args.overview_url,
+                         args.lot_from, args.lot_to, start, now)
+
+    return publish_snapshot(args, auction, start, now, history_builder,
+                            lambda staging, log: collect_christies_lots(
+                                args, fetch, auction, start, now, staging, log), recheck)
+
+
+def collect_christies_lots(args, fetch, auction, start, now, staging, log):
+    lots, estimates, seen = [], [], set()
+    candidates = candidate_rows(args, fetch, auction, log, now)
+    candidates.sort(key=lambda candidate: lot_number(candidate[0]) or (0, ""))
+    for row, url, html, labels in candidates:
+        check_deadline(start, now)
+        number = lot_number(row)
+        stage = "catalog"
+        try:
+            if not in_lot_range(number, args.lot_from, args.lot_to):
+                raise PipelineError("Lot number outside the selected session range")
+            identity = lot_identity(url)
+            if identity != str(row.get("object_id")):
+                raise PipelineError("Catalog object ID does not match lot URL")
+            if identity in seen:
+                raise PipelineError("Duplicate lot object ID")
+            reject_realised(row, auction["earlier_session_starts"])
+            if html is None and not painting_medium(plain_text(row.get("description_txt"))):
+                raise PipelineError("Technique excluded by the catalog painting filter")
+            stage = "card"
+            if html is None:
+                html = page(fetch, url)
+                lot, labels = card_data(html, identity, auction)
+            else:
+                lot = row
+            if lot_number(lot) != number:
+                raise PipelineError("Lot number in the card conflicts with the catalog")
+            reject_realised(lot)
+            soup = BeautifulSoup(html, "html.parser")
+            sections = catalogue_sections(soup)
+            details = sections.get("details", "")
+            medium = painting_medium(details)
+            artist = plain_text(lot.get("title_primary_txt"))
+            title = plain_text(lot.get("title_secondary_txt"))
+            if not medium or not artist or not title:
+                raise PipelineError("Details do not confirm a painting, artist or title")
+            stage = "estimate"
+            estimate = estimate_data(lot, labels)
+            stage = "image"
+            extension, body = download_photo(fetch, photo_candidates(soup, row, url))
+        except AuctionStatusError:
+            raise
+        except (PipelineError, requests.RequestException, UnicodeError) as exc:
+            log_entry(log, url, stage, exc)
+            continue
+        collected = now()
+        check_deadline(start, lambda: collected)
+        image_path = f"images/{identity}{extension}"
+        (staging / image_path).write_bytes(body)
+        lot_row = dict(
+            lot_id=identity, lot_number=lot_label(number), sale_id=auction["sale_id"],
+            lot_url=BASE + f"/en/lot/lot-{identity}", artist=artist, title=title,
+            creation_date_raw=matching_line(details, CREATION), medium_raw=medium,
+            dimensions_raw=dimensions_text(details),
+            details_raw=details,
+            provenance_raw=sections.get("provenance", ""),
+            exhibited_raw=sections.get("exhibited", ""),
+            literature_raw=sections.get("literature", ""),
+            lot_essay_raw=sections.get("lot essay", ""),
+            condition_raw=sections.get("condition report", sections.get("condition", "")),
+            image_path=image_path, collected_at_utc=utc_text(collected),
+            session_start_utc=utc_text(start), cutoff_source_url=args.overview_url,
+        )
+        lots.append({field: csv_text(value) if isinstance(value, str) else value
+                     for field, value in lot_row.items()})
+        estimates.append(dict(estimate, lot_id=identity, collected_at_utc=utc_text(collected)))
+        seen.add(identity)
+        if len(lots) == args.limit:
+            break
+    return lots, estimates
+
+
+def publish_snapshot(args, auction, start, now, history_builder, collect_lots, recheck):
+    source = auction.get("source", "christies")
     log = []
     name = collection_name(auction, args, now())
     staging = args.output_dir / f"{name} ({uuid4().hex[:8]}).incomplete"
     (staging / "images").mkdir(parents=True)
-    lots, estimates, seen = [], [], set()
     try:
-        candidates = candidate_rows(args, fetch, auction, log, now)
-        candidates.sort(key=lambda candidate: lot_number(candidate[0]) or (0, ""))
-        for row, url, html, labels in candidates:
-            check_deadline(start, now)
-            number = lot_number(row)
-            stage = "catalog"
-            try:
-                if not in_lot_range(number, args.lot_from, args.lot_to):
-                    raise PipelineError("Lot number outside the selected session range")
-                identity = lot_identity(url)
-                if identity != str(row.get("object_id")):
-                    raise PipelineError("Catalog object ID does not match lot URL")
-                if identity in seen:
-                    raise PipelineError("Duplicate lot object ID")
-                reject_realised(row, auction["earlier_session_starts"])
-                if html is None and not painting_medium(plain_text(row.get("description_txt"))):
-                    raise PipelineError("Technique excluded by the catalog painting filter")
-                stage = "card"
-                if html is None:
-                    html = page(fetch, url)
-                    lot, labels = card_data(html, identity, auction)
-                else:
-                    lot = row
-                if lot_number(lot) != number:
-                    raise PipelineError("Lot number in the card conflicts with the catalog")
-                reject_realised(lot)
-                soup = BeautifulSoup(html, "html.parser")
-                sections = catalogue_sections(soup)
-                details = sections.get("details", "")
-                medium = painting_medium(details)
-                artist = plain_text(lot.get("title_primary_txt"))
-                title = plain_text(lot.get("title_secondary_txt"))
-                if not medium or not artist or not title:
-                    raise PipelineError("Details do not confirm a painting, artist or title")
-                stage = "estimate"
-                estimate = estimate_data(lot, labels)
-                stage = "image"
-                extension, body = download_photo(fetch, photo_candidates(soup, row, url))
-            except AuctionStatusError:
-                raise
-            except (PipelineError, requests.RequestException, UnicodeError) as exc:
-                log_entry(log, url, stage, exc)
-                continue
-            collected = now()
-            check_deadline(start, lambda: collected)
-            image_path = f"images/{identity}{extension}"
-            (staging / image_path).write_bytes(body)
-            lot_row = dict(
-                lot_id=identity, lot_number=lot_label(number), sale_id=auction["sale_id"],
-                lot_url=BASE + f"/en/lot/lot-{identity}", artist=artist, title=title,
-                creation_date_raw=matching_line(details, CREATION), medium_raw=medium,
-                dimensions_raw=dimensions_text(details),
-                details_raw=details,
-                provenance_raw=sections.get("provenance", ""),
-                exhibited_raw=sections.get("exhibited", ""),
-                literature_raw=sections.get("literature", ""),
-                lot_essay_raw=sections.get("lot essay", ""),
-                condition_raw=sections.get("condition report", sections.get("condition", "")),
-                image_path=image_path, collected_at_utc=utc_text(collected),
-                session_start_utc=utc_text(start), cutoff_source_url=args.overview_url,
-            )
-            lots.append({field: csv_text(value) if isinstance(value, str) else value
-                         for field, value in lot_row.items()})
-            estimates.append(dict(estimate, lot_id=identity, collected_at_utc=utc_text(collected)))
-            seen.add(identity)
-            if len(lots) == args.limit:
-                break
+        lots, estimates = collect_lots(staging, log)
         write_csv(staging / "lots.csv", LOT_FIELDS, lots)
         write_csv(staging / "estimates.csv", ESTIMATE_FIELDS, estimates)
         if len(lots) < 10:
@@ -893,26 +912,25 @@ def collect(args, fetch, now=utc_now, history_builder=None):
                 history = history_builder(lots, start)
                 write_json(staging / HISTORY_FILE, history)
                 checked_history(history, lots, start, now())
-                confirm_schedule(page(fetch, args.overview_url), args.overview_url,
-                                 args.lot_from, args.lot_to, start, now)
+                recheck()
             except DeadlineError:
                 raise
             except (PipelineError, OSError, requests.RequestException, UnicodeError, ValueError) as exc:
                 raise HistoryReadinessError(str(exc)) from exc
         with FileLock(args.output_dir / ".collections.lock", timeout=30):
             ready_at = now() if history_builder is not None else None
-            write_manifest(staging, start, ready_at)
+            write_manifest(staging, start, ready_at, source)
             check_deadline(start, now)
             destination = free_name(args.output_dir, name)
             staging.rename(destination)
             if ready_at is not None:
-                cleanup_expired(args.output_dir, destination, now)
+                cleanup_expired(args.output_dir, destination, now, source)
     except (PipelineError, OSError, requests.RequestException, UnicodeError, Timeout) as exc:
         if not staging.exists():
             raise
         log_entry(log, args.catalog_url, "snapshot", exc)
         write_log(staging / "errors.txt", log)
-        write_manifest(staging, start)
+        write_manifest(staging, start, source=source)
         error_type = type(exc) if isinstance(exc, (HistoryReadinessError, DeadlineError)) else PipelineError
         raise error_type(f"{exc}. Incomplete attempt: {staging}") from exc
     return destination, len(lots)

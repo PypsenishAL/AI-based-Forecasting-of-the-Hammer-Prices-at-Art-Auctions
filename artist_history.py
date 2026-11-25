@@ -258,12 +258,19 @@ def build_history(lots, fetch, now=loader.utc_now, workers=4, deadline=None):
             for name, dates, sale in sales:
                 key = (sale["sale_format"], sale["historical_lot_id"])
                 by_artist[name].setdefault(key, (dates, sale))
-    briefs = []
     if deadline is not None:
         loader.check_deadline(deadline, now)
+    return summarize_history(lots, by_artist, start, cutoff, now(), deadline,
+                             len(months), len(catalogues), errors,
+                             "christies_public_painting_catalogues")
+
+
+def summarize_history(lots, by_artist, start, cutoff, generated, deadline,
+                      months, catalogues, errors, source_scope):
+    briefs = []
     for row in lots:
         name, dates = artist_identity(row["artist"])
-        related = [sale for match, sale in by_artist[name].values()
+        related = [sale for match, sale in by_artist.get(name, {}).values()
                    if all(left == right for left, right in zip(dates, match))]
         related.sort(key=lambda sale: (sale["sale_date"], sale["historical_lot_id"]))
         currencies = defaultdict(list)
@@ -292,12 +299,12 @@ def build_history(lots, fetch, now=loader.utc_now, workers=4, deadline=None):
                        },
                        "sales": related})
     return {
-        "schema_version": 2, "source_scope": "christies_public_painting_catalogues",
+        "schema_version": 2, "source_scope": source_scope,
         "price_basis": "price_realised", "includes_buyer_premium": True,
         "window_start_utc": loader.utc_text(start), "cutoff_utc": loader.utc_text(cutoff),
-        "generated_at_utc": loader.utc_text(now()), "archive_months_requested": len(months),
+        "generated_at_utc": loader.utc_text(generated), "archive_months_requested": months,
         "session_start_utc": loader.utc_text(deadline) if deadline is not None else None,
-        "catalogues_requested": len(catalogues), "source_errors": errors,
+        "catalogues_requested": catalogues, "source_errors": errors,
         "coverage_status": "partial" if errors else "scanned" if catalogues else "no_catalogues_found",
         "lots": briefs,
     }
