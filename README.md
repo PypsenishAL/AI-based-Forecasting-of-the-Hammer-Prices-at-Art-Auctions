@@ -1,6 +1,20 @@
 # AI-based-Forecasting-of-the-Hammer-Prices-at-Art-Auctions
 Forecasting auction prices for works of art using technologies of large language models and deep learning
 
+## Структура проекта
+
+| Путь | Назначение |
+| --- | --- |
+| `auction_pipeline/sources/christies/` и `auction_pipeline/sources/sothebys/` | Адаптеры двух аукционных домов. В каждом пакете есть модуль текущего каталога и модуль исторических результатов. |
+| `auction_pipeline/common.py` | Общие правила проверки времени, данных лота, эстимейтов и изображений. |
+| `auction_pipeline/history.py` | Пятилетнее окно, статистика продаж и отбор сопоставимых работ. |
+| `auction_pipeline/snapshots.py` | Запись снимка, контрольные суммы, очистка и формирование пакетов для агентов. |
+| `tests/` | Проверки адаптеров и жизненного цикла снимка. |
+| `docs/` | Место для локальных материалов диплома. |
+| `snapshots/` | Локальные выгрузки. Каталог исключён из Git. |
+
+Корневые `load_christies.py`, `load_sothebys.py` и `artist_history.py` запускают соответствующие команды пакета. Адаптеры используют общие правила и формат снимка без зависимости Sotheby’s от адаптера Christie’s.
+
 ## Предаукционная выгрузка Christie’s
 
 Python 3.11+.

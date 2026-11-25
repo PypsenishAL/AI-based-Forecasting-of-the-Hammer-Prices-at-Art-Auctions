@@ -4,7 +4,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-import artist_history as history
+from auction_pipeline import common, snapshots
+from auction_pipeline.sources.christies import results as history
 
 
 class HistoryTests(unittest.TestCase):
@@ -88,14 +89,13 @@ class HistoryTests(unittest.TestCase):
 
         sales, errors = history.catalogue_sales(
             catalog, fetch, {"helen frankenthaler"}, set(),
-            history.loader.utc_datetime("2021-11-17T07:00Z"),
-            history.loader.utc_datetime("2026-11-17T07:00Z"))
+            common.utc_datetime("2021-11-17T07:00Z"),
+            common.utc_datetime("2026-11-17T07:00Z"))
         self.assertEqual([row["historical_lot_id"] for _, _, row in sales], ["99", "100"])
         self.assertEqual(len(errors), 2)
         self.assertIn("page=3", errors[0]["url"])
 
     def test_backfill_does_not_modify_snapshot_or_unlock_mark_used(self):
-        loader = history.loader
         timestamp = "2026-11-17T07:00:00Z"
         with tempfile.TemporaryDirectory() as folder:
             snapshot = Path(folder) / "snapshot"
@@ -108,18 +108,18 @@ class HistoryTests(unittest.TestCase):
                 lots.append(dict(lot_id=lot_id, artist="Example Artist",
                                  collected_at_utc=timestamp, image_path=image_path))
                 estimates.append(dict(lot_id=lot_id))
-            loader.write_csv(snapshot / "lots.csv", loader.LOT_FIELDS, lots)
-            loader.write_csv(snapshot / "estimates.csv", loader.ESTIMATE_FIELDS, estimates)
-            loader.write_manifest(snapshot, loader.utc_datetime("2026-11-20T15:30Z"))
+            snapshots.write_csv(snapshot / "lots.csv", snapshots.LOT_FIELDS, lots)
+            snapshots.write_csv(snapshot / "estimates.csv", snapshots.ESTIMATE_FIELDS, estimates)
+            snapshots.write_manifest(snapshot, common.utc_datetime("2026-11-20T15:30Z"))
             path = history.history_for_snapshot(snapshot, lambda _: b"<h1>Auction results</h1>")
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["coverage_status"],
                              "no_catalogues_found")
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["purpose"], "retrospective_backfill")
-            self.assertFalse((snapshot / loader.HISTORY_FILE).exists())
-            manifest = json.loads((snapshot / loader.MANIFEST).read_text(encoding="utf-8"))
-            self.assertEqual(manifest["files"], loader.hash_files(snapshot))
-            with self.assertRaises(loader.HistoryReadinessError):
-                loader.archive_used_lots(snapshot, {"101"})
+            self.assertFalse((snapshot / snapshots.HISTORY_FILE).exists())
+            manifest = json.loads((snapshot / snapshots.MANIFEST).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["files"], snapshots.hash_files(snapshot))
+            with self.assertRaises(common.HistoryReadinessError):
+                snapshots.archive_used_lots(snapshot, {"101"})
 
     def test_online_catalogue_uses_exact_lot_close_and_cumulative_last_page(self):
         alias = "https://www.christies.com/en/auction/auction-30749/browse-lots"
@@ -146,8 +146,8 @@ class HistoryTests(unittest.TestCase):
                      "https://onlineonly.christies.com/s/first-open/lots/3810?page=2": packed([lot, future])}
         sales, errors = history.catalogue_sales(
             alias, responses.__getitem__, {"helen frankenthaler"}, set(),
-            history.loader.utc_datetime("2021-11-17T07:00Z"),
-            history.loader.utc_datetime("2026-11-17T07:00Z"))
+            common.utc_datetime("2021-11-17T07:00Z"),
+            common.utc_datetime("2026-11-17T07:00Z"))
         self.assertEqual(errors, [])
         sale, = [row for _, _, row in sales]
         self.assertEqual(sale["sale_format"], "online")

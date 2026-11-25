@@ -8,7 +8,8 @@ from pathlib import Path
 
 from PIL import Image, PngImagePlugin
 
-import load_christies as loader
+from auction_pipeline import common, snapshots
+from auction_pipeline.sources.christies import catalogue as loader
 
 
 OVERVIEW = 'https://www.christies.com/en/auction/auction-24268-nyr/overview'
@@ -61,7 +62,7 @@ def pages():
 def ready_history(lots, start, *, generated=None, coverage="scanned"):
     return {
         "schema_version": 2, "coverage_status": coverage, "source_errors": [],
-        "session_start_utc": loader.utc_text(start),
+        "session_start_utc": common.utc_text(start),
         "cutoff_utc": lots[0]["collected_at_utc"],
         "generated_at_utc": generated or lots[-1]["collected_at_utc"],
         "lots": [{"lot_id": row["lot_id"], "hammer_comparables": {
@@ -72,22 +73,22 @@ def ready_history(lots, start, *, generated=None, coverage="scanned"):
 
 class LoaderTests(unittest.TestCase):
     def test_estimate_rejects_disagreement_with_display(self):
-        with self.assertRaisesRegex(loader.PipelineError, "display"):
-            loader.estimate_data(
+        with self.assertRaisesRegex(common.PipelineError, "display"):
+            common.estimate_data(
                 dict(estimate_txt="USD 300 - 400", estimate_low=100, estimate_high=200),
                 {"currency_txt": "USD"},
             )
 
     def test_blind_text_drops_unlabelled_amounts_without_stripping_artist_name(self):
-        self.assertEqual(loader.blind_text(r"Estimate\n400000–600000\nGallery A"), "Gallery A")
-        self.assertEqual(loader.blind_text(r"Estimate\n100–200\nGallery A"), "Gallery A")
-        self.assertEqual(loader.blind_text("Ken Price", identity_field=True), "Ken Price")
+        self.assertEqual(snapshots.blind_text(r"Estimate\n400000–600000\nGallery A"), "Gallery A")
+        self.assertEqual(snapshots.blind_text(r"Estimate\n100–200\nGallery A"), "Gallery A")
+        self.assertEqual(snapshots.blind_text("Ken Price", identity_field=True), "Ken Price")
 
     def test_session_supports_suffixed_numbers(self):
         low, high, _ = next(loader.numeric_sessions(
             {"sessions": [{"lot_txt": "Lots 1A–79A"}]}))
-        self.assertTrue(loader.in_lot_range(loader.lot_number({"lot_id_txt": "20A"}), low, high))
-        self.assertFalse(loader.in_lot_range(loader.lot_number({"lot_id_txt": "20B"}), low, high))
+        self.assertTrue(common.in_lot_range(loader.lot_number({"lot_id_txt": "20A"}), low, high))
+        self.assertFalse(common.in_lot_range(loader.lot_number({"lot_id_txt": "20B"}), low, high))
 
     def test_end_to_end_keeps_valid_lots_and_logs_price_and_bad_image(self):
         image = io.BytesIO()
@@ -143,19 +144,19 @@ class LoaderTests(unittest.TestCase):
             edited, _ = loader.collect(old_args, fetch, lambda: NOW, ready_history)
             with (edited / 'errors.txt').open('a', encoding='utf-8') as file:
                 file.write('analysis notes\n')
-            saved = loader.archive_used_lots(old, {'702', '703'})
+            saved = snapshots.archive_used_lots(old, {'702', '703'})
             old_failures = dict(responses)
             responses = {url: html.replace(START, later) for url, html in responses.items()}
             fresh_args = manual_args(['--output-dir', folder, '--limit', '10',
                                             '--session-start', later])
-            with self.assertRaises(loader.PipelineError):
+            with self.assertRaises(common.PipelineError):
                 loader.collect(fresh_args, lambda url: old_failures[url].encode(), lambda: march)
             self.assertTrue(old.exists())
-            with self.assertRaisesRegex(loader.HistoryReadinessError, "incomplete"):
+            with self.assertRaisesRegex(common.HistoryReadinessError, "incomplete"):
                 loader.collect(fresh_args, fetch, lambda: march,
                                lambda lots, start: ready_history(lots, start, coverage="partial"))
             self.assertTrue(old.exists())
-            with self.assertRaisesRegex(loader.HistoryReadinessError, "timestamps"):
+            with self.assertRaisesRegex(common.HistoryReadinessError, "timestamps"):
                 loader.collect(fresh_args, fetch, lambda: march,
                                lambda lots, start: ready_history(lots, start, generated=later))
             self.assertTrue(old.exists())
@@ -177,12 +178,12 @@ class LoaderTests(unittest.TestCase):
                 self.assertNotIn("Comment", clean_photo.info)
 
     def test_deadline_rejects_before_any_http_request(self):
-        with self.assertRaisesRegex(loader.PipelineError, 'deadline'):
+        with self.assertRaisesRegex(common.PipelineError, 'deadline'):
             loader.collect(manual_args(['--session-start', START]), lambda _: self.fail('HTTP requested'),
-                           lambda: loader.utc_datetime(START))
+                           lambda: common.utc_datetime(START))
 
     def test_conflicting_schedule_blocks_collection(self):
-        with self.assertRaisesRegex(loader.PipelineError, 'schedule'):
+        with self.assertRaisesRegex(common.PipelineError, 'schedule'):
             loader.collect(manual_args(['--session-start', '2026-11-20T14:30Z']),
                            lambda url: pages()[url].encode(), lambda: NOW)
 
@@ -192,7 +193,7 @@ class LoaderTests(unittest.TestCase):
         responses[url] = responses[url].replace('"is_in_progress": false',
                                                 '"is_in_progress": true')
         with tempfile.TemporaryDirectory() as folder:
-            with self.assertRaisesRegex(loader.PipelineError, 'status'):
+            with self.assertRaisesRegex(common.PipelineError, 'status'):
                 loader.collect(manual_args(['--output-dir', folder]),
                                lambda url: responses[url].encode(), lambda: NOW)
             attempts = list(Path(folder).iterdir())
@@ -209,8 +210,8 @@ class LoaderTests(unittest.TestCase):
         auction = loader.component(html, "auction")["data"]
         html = component("auction", {"data": dict(auction, auction_status=status)})
         _, official = loader.confirm_schedule(html, OVERVIEW, (701, ""), (864, ""), None,
-                                               lambda: loader.utc_datetime("2026-11-20T15:00Z"))
-        self.assertEqual(loader.utc_text(official), START)
+                                               lambda: common.utc_datetime("2026-11-20T15:00Z"))
+        self.assertEqual(common.utc_text(official), START)
 
     def test_current_catalogue_reads_reported_extra_pages(self):
         first = {"object_id": "1"}
@@ -229,7 +230,7 @@ class LoaderTests(unittest.TestCase):
         truncated = html.replace('"total_hits_filtered": 2', '"total_hits_filtered": 3').replace(
             '"pagesize": "1"', '"pagesize": "2"').replace(
             '"lots": [{"object_id": "1"}]', '"lots": [{"object_id": "1"}, {"object_id": "2"}]')
-        with self.assertRaises(loader.PipelineError):
+        with self.assertRaises(common.PipelineError):
             loader.current_catalogue_rows(truncated, CATALOG, lambda _: b"[]")
 
     def test_automatic_collection_after_pilot_uses_next_month_and_official_session_time(self):
@@ -258,16 +259,16 @@ class LoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path, count = loader.collect(loader.parse_args(['--output-dir', folder]), fetch, lambda: now)
             self.assertEqual(count, 11)
-            rows = loader.read_csv(path / 'lots.csv', loader.LOT_FIELDS)
+            rows = snapshots.read_csv(path / 'lots.csv', snapshots.LOT_FIELDS)
             self.assertEqual({r['session_start_utc'] for r in rows}, {later})
             self.assertEqual({r['cutoff_source_url'] for r in rows}, {f'{new_auction}/overview'})
 
     def test_painting_filter_uses_whole_lines(self):
-        self.assertEqual(loader.painting_medium('signed in oil\nOil on linen'), 'Oil on linen')
-        self.assertEqual(loader.painting_medium('oil on canvas, in artist’s frame'), 'oil on canvas, in artist’s frame')
+        self.assertEqual(common.painting_medium('signed in oil\nOil on linen'), 'Oil on linen')
+        self.assertEqual(common.painting_medium('oil on canvas, in artist’s frame'), 'oil on canvas, in artist’s frame')
         for medium in ('oil on canvas print', 'mixed media on canvas',
                        'oil on paper mounted on canvas', 'oil on printed canvas'):
-            self.assertEqual(loader.painting_medium(medium), '')
+            self.assertEqual(common.painting_medium(medium), '')
 
 
 if __name__ == '__main__':

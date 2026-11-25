@@ -7,7 +7,9 @@ from uuid import UUID
 
 from PIL import Image
 
-import load_sothebys as s
+from auction_pipeline import snapshots
+from auction_pipeline.sources.sothebys import catalogue as s
+from auction_pipeline.sources.sothebys import results
 
 
 class SothebysTests(unittest.TestCase):
@@ -58,11 +60,11 @@ class SothebysTests(unittest.TestCase):
                                  "--limit", "10", "--output-dir", directory])
             snapshot, count = s.collect(args, pages.__getitem__, now=now)
             self.assertEqual(count, 10)
-            self.assertEqual(len(s.common.read_csv(snapshot / "lots.csv", s.common.LOT_FIELDS)), 10)
-            manifest = json.loads((snapshot / s.common.MANIFEST).read_text(encoding="utf-8"))
+            self.assertEqual(len(snapshots.read_csv(snapshot / "lots.csv", snapshots.LOT_FIELDS)), 10)
+            manifest = json.loads((snapshot / snapshots.MANIFEST).read_text(encoding="utf-8"))
             self.assertEqual(manifest["source"], "sothebys")
             self.assertTrue(manifest["analysis_ready_at_utc"])
-            used = s.common.archive_used_lots(snapshot, {cards[0]["lotId"]})
+            used = snapshots.archive_used_lots(snapshot, {cards[0]["lotId"]})
             blind = json.loads((used / "blind" / "lots.json").read_text(encoding="utf-8"))["lots"][0]
             self.assertEqual(blind["hammer_comparables"]["groups"]["USD"]["median"], "120")
             self.assertNotIn("lot_url", blind)
@@ -75,16 +77,16 @@ class SothebysTests(unittest.TestCase):
             (modified_catalogue / "notes.txt").write_text("Research notes", encoding="utf-8")
             legacy = root / "older-attempt.incomplete"
             (legacy / "images").mkdir(parents=True)
-            s.common.write_log(legacy / "errors.txt", [(catalog, "snapshot", "Catalogue failed")])
-            s.common.write_manifest(legacy, s.common.utc_datetime(start))
-            manifest_path = legacy / s.common.MANIFEST
+            snapshots.write_log(legacy / "errors.txt", [(catalog, "snapshot", "Catalogue failed")])
+            snapshots.write_manifest(legacy, s.common.utc_datetime(start))
+            manifest_path = legacy / snapshots.MANIFEST
             legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             del legacy_manifest["source"]
-            s.common.write_json(manifest_path, legacy_manifest)
+            snapshots.write_json(manifest_path, legacy_manifest)
 
             christies = root / "other-house"
             (christies / "images").mkdir(parents=True)
-            s.common.write_manifest(christies, s.common.utc_datetime(start))
+            snapshots.write_manifest(christies, s.common.utc_datetime(start))
             later_start = "2026-12-10T13:30Z"
             later_now = lambda: s.common.utc_datetime("2026-12-05T10:00Z")
             refreshed = {url: payload.replace(start.encode(), later_start.encode()) if url != photo else payload
@@ -114,6 +116,6 @@ class SothebysTests(unittest.TestCase):
         self.assertEqual(session[0], s.common.utc_datetime("2026-12-03T13:30Z"))
 
     def test_hidden_results_are_not_unsold(self):
-        self.assertIsNone(s.public_result({"sold": {"__typename": "ResultHidden"}}, "USD"))
-        self.assertEqual(s.public_result(
+        self.assertIsNone(results.public_result({"sold": {"__typename": "ResultHidden"}}, "USD"))
+        self.assertEqual(results.public_result(
             {"sold": {"__typename": "ResultVisible", "isSold": False}}, "USD"), (None, None))
